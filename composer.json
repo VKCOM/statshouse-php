@@ -3,6 +3,9 @@
   "description": "StatsHouse client library for PHP and KPHP",
   "homepage": "https://github.com/VKCOM/statshouse-php",
   "keywords": ["statshouse", "metrics", "monitoring"],
+  "support": {
+    "issues": "https://github.com/VKCOM/statshouse-php/issues"
+  },
   "type": "library",
   "license": "MPL-2.0",
   "require": {
