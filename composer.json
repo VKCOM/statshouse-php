@@ -2,7 +2,7 @@
   "name": "vkcom/statshouse",
   "description": "StatsHouse client library for PHP and KPHP",
   "homepage": "https://github.com/VKCOM/statshouse-php",
-  "keywords": ["statshouse", "metrics", "monitoring"],
+  "keywords": ["statshouse", "metrics", "monitoring", "statistics"],
   "support": {
     "issues": "https://github.com/VKCOM/statshouse-php/issues"
   },
