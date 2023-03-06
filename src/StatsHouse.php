@@ -40,7 +40,6 @@ class StatsHouse {
   private const TL_STATSHOUSE_METRIC_TS_FIELDS_MASK       = 1 << 4;
   private const TL_STATSHOUSE_METRIC_VALUE_FIELDS_MASK    = 1 << 1;
   private const TL_STATSHOUSE_METRIC_UNIQUE_FIELDS_MASK   = 1 << 2;
-  private const TL_STATSHOUSE_METRIC_NEW_COUNTER_SEMANTIC = 1 << 31; // use new semantic after all agents updated
 
   /** @var string|false|mixed $udp_socket */
   private $udp_socket                = false;
@@ -170,7 +169,6 @@ class StatsHouse {
     if ($ts !== 0) {
       $fields_mask |= self::TL_STATSHOUSE_METRIC_TS_FIELDS_MASK;
     }
-    $fields_mask |= self::TL_STATSHOUSE_METRIC_NEW_COUNTER_SEMANTIC;
     $data .= pack('V', $fields_mask); // metric fields mask
     $data .= self::packShortString($metric);
     $data .= pack('V', count($keys));
