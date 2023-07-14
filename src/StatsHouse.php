@@ -48,9 +48,11 @@ class StatsHouse {
   private bool $shutdown_registered  = false;
   private string $addr;
   private float $last_flush_ts       = 0;
+  private ?float $timeout;
 
-  public function __construct(string $addr) {
+  public function __construct(string $addr, ?float $timeout = null) {
     $this->addr = $addr;
+    $this->timeout = $timeout;
   }
 
   /**
@@ -230,7 +232,7 @@ class StatsHouse {
 
     $error_code    = 0;
     $error_message = '';
-    $sock = stream_socket_client($this->addr, $error_code, $error_message); // KPHP does not have fsockopen
+    $sock = stream_socket_client($this->addr, $error_code, $error_message, $this->timeout); // KPHP does not have fsockopen
     if ($sock === false) {
       return "$error_message (code $error_code)";
     }
