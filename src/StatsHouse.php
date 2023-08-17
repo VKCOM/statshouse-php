@@ -281,3 +281,39 @@ class StatsHouse {
     return null;
   }
 }
+
+/**
+ * Advanced feature.
+ * Encodes float into format suitable for raw tag
+ * Sorting order of original floats is preserved (except NaNs), also both +-0 map into +0
+ */
+function lexEncFloat(float $f): int {
+  if (is_nan($f)) {
+    return 0; // no sortable binary representation for NaN
+  }
+  if ($f == 0) {
+    return 0;
+  }
+  $data = pack('f', $f);
+  $arr = unpack('l', $data);
+  if ($arr === false) {
+    return 0; // never
+  }
+  $l = (int)$arr[1];
+  if ($l < 0) {
+    $l ^= 0x7fffffff; // flip all except signbit so bigger negatives go before smaller ones
+  }
+  return $l;
+}
+
+function lexDecFloat(int $l): float {
+  if ($l < 0) {
+    $l ^= 0x7fffffff;
+  }
+  $data = pack('l', $l);
+  $arr = unpack('f', $data);
+  if ($arr === false) {
+    return 0; // never
+  }
+  return (float)$arr[1];
+}
