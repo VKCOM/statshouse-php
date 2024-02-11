@@ -158,11 +158,14 @@ class StatsHouse {
   /**
    * Advanced feature.
    * Encodes float as a raw tag in a special format, used by Statshouse.
-   * Ordering of most float values is preserved after encoding.
+   * Ordering of all float values is preserved after encoding, except for NANs.
+   * Most users are recommended to not check for false, but simply cast result to int.
+   *
+   * @return int|false
    */
-  public static function lexEncFloat(float $f): int {
+  public static function lexEncFloat(float $f) {
     if (is_nan($f)) {
-      return 0; // no sortable binary representation for NaN
+      return false; // no sortable binary representation for NaN
     }
     if ($f == 0) {
       return 0;
@@ -170,7 +173,7 @@ class StatsHouse {
     $data = pack('f', $f);
     $arr = unpack('l', $data);
     if ($arr === false) {
-      return 0; // never
+      return false; // never
     }
     $l = (int)$arr[1];
     if ($l < 0) {
