@@ -10,6 +10,10 @@ declare(strict_types = 1);
 
 namespace VK\StatsHouse;
 
+use Exception;
+
+class StatsHouseException extends Exception {}
+
 /**
  * New TL-based statshouse transport layer.
  * All strings must be in utf-8 encoding.
@@ -41,16 +45,33 @@ class StatsHouse {
   private const TL_STATSHOUSE_METRIC_VALUE_FIELDS_MASK    = 1 << 1;
   private const TL_STATSHOUSE_METRIC_UNIQUE_FIELDS_MASK   = 1 << 2;
 
-  /** @var string|false|mixed $udp_socket */
-  private $udp_socket                = false;
+  private const NW_UDP = "udp";
+  private const NW_UNIXGRAM = "unixgram";
+  private const NW_ALLOWED = [self::NW_UDP, self::NW_UNIXGRAM];
+
+  /** @var string|false|mixed $socket */
+  private $socket                    = false;
   private string $packet             = '';
   private bool $immediate_flush      = false;
   private bool $shutdown_registered  = false;
+  private string $network;
   private string $addr;
+  private int $port = 0;
   private float $last_flush_ts       = 0;
 
-  public function __construct(string $addr) {
-    $this->addr = $addr;
+  public function __construct(string $uri) {
+    $uri_parts = explode("://", $uri, 2);
+    if (count($uri_parts) != 2 || !in_array($uri_parts[0], self::NW_ALLOWED)) {
+      throw new StatsHouseException("Illegal address passed: " + $uri);
+    }
+    $this->network = $uri_parts[0];
+    if ($this->network == self::NW_UNIXGRAM) {
+      $this->addr = $uri_parts[1];
+      return;
+    }
+    $addr_parts = explode(":", $uri_parts[1], 2);
+    $this->addr = $addr_parts[0];
+    $this->port = intval($addr_parts[1]);
   }
 
   /**
@@ -260,20 +281,34 @@ class StatsHouse {
   }
 
   private function maybeConnect(): ?string {
-    if ($this->udp_socket) {
+    if ($this->socket) {
       return null;
     }
 
-    $error_code    = 0;
-    $error_message = '';
-    $sock = stream_socket_client($this->addr, $error_code, $error_message); // KPHP does not have fsockopen
+    if ($this->network == self::NW_UNIXGRAM) {
+      $sock = socket_create(AF_UNIX, SOCK_DGRAM, 0);
+    } else if ($this->network == self::NW_UDP) {
+      $sock = socket_create(AF_INET, SOCK_DGRAM, SOL_UDP);
+    }
     if ($sock === false) {
+      return "failed to create $this->network socket";
+    }
+    if ($this->network == self::NW_UNIXGRAM) {
+      $ok = socket_set_nonblock($sock);
+      if ($ok === false) {
+        return "failed to make $this->network socket nonblocking";
+      }
+    }
+    $ok = socket_connect($sock, $this->addr, $this->port);
+    if (!$ok) {
+      $error_code    = socket_last_error($sock);
+      $error_message = socket_strerror($error_code);
       return "$error_message (code $error_code)";
     }
 
     // earlier versions of KPHP thought $sock is mixed, not string|false, so we had #ifndef KPHP here
     // in PHP, $sock is resource, but that does not matter as annotations are skipped
-    $this->udp_socket = $sock;
+    $this->socket = $sock;
     return null;
   }
 
@@ -283,10 +318,11 @@ class StatsHouse {
       return "$metric: failed to connect: $err";
     }
 
-    $ok = @fwrite($this->udp_socket, $this->packet);
+    // $ok = @fwrite($this->udp_socket, $this->packet);
+    $ok = socket_send($this->socket, $this->packet, strlen($this->packet), 0);
     if ($ok === false || $close_after) {
-      fclose($this->udp_socket);
-      $this->udp_socket = false;
+      socket_close($this->socket);
+      $this->socket = false;
     }
 
     if ($ok === false) {
