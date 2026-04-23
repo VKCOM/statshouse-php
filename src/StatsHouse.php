@@ -319,7 +319,7 @@ class StatsHouse {
         continue;
       }
 
-      $ips = self::resolveHostIPv4($host);
+      $ips = self::resolveHost($host);
       for ($j = 0; $j < count($ips); $j++) {
         $resolved[] = $network . '://' . $ips[$j] . ':' . $port;
       }
