@@ -1,6 +1,10 @@
 <?php
 include 'src/StatsHouse.php';
-$sh = new VK\StatsHouse\StatsHouse('udp://127.0.0.1:13337');
+$addr = '{{ .StatsHouseAddr }}';
+if (strpos($addr, '://') === false) {
+    $addr = 'tcp://' . $addr;
+}
+$sh = new VK\StatsHouse\StatsHouse($addr);
 for ($x = 0; $x < {{.NumberOfIterations}}; $x++) {
     {{- range $v := .Metrics -}}
     {{- if eq $v.Kind 2 }}
