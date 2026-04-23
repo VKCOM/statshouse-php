@@ -354,7 +354,7 @@ class StatsHouse {
    * @return string[]
    */
   private function addSystemTags($keys): array {
-    if ($this->host_tag !== '') {
+    if ($this->host_tag !== '' && !array_key_exists('_h', $keys)) {
       $keys['_h'] = $this->host_tag;
     }
     return $keys;
