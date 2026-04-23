@@ -336,7 +336,7 @@ class StatsHouse {
    *
    * @return string[]
    */
-  private static function resolveHostIPv4(string $host): array {
+  private static function resolveHost(string $host): array {
     @ini_set('default_socket_timeout', (string)self::DNS_REFRESH_TIMEOUT_SEC);
     $ips = gethostbynamel($host);
     if ($ips !== false) {
