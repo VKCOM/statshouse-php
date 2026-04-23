@@ -417,7 +417,6 @@ class StatsHouse {
       }
       $sock = ($role === 'primary') ? $this->tcp_primary_socket : $this->tcp_secondary_socket;
     }
-
     $ok = @fwrite($sock, $payload);
     if ($ok !== false) {
       return true;
