@@ -41,34 +41,29 @@ class StatsHouse {
   private const TL_STATSHOUSE_METRIC_VALUE_FIELDS_MASK    = 1 << 1;
   private const TL_STATSHOUSE_METRIC_UNIQUE_FIELDS_MASK   = 1 << 2;
 
-  private const TCP_HEADER               = "statshousev1";
-  private const DNS_REFRESH_INTERVAL_SEC = 60.0;
-  private const DNS_REFRESH_TIMEOUT_SEC  = 3;
+  private const RARE_LOG_INTERVAL_SEC    = 1.0;
 
   /** @var string|false|mixed $udp_socket */
   private $udp_socket                = false;
-  /** @var string|false|mixed $tcp_primary_socket */
-  private $tcp_primary_socket        = false;
-  /** @var string|false|mixed $tcp_secondary_socket */
-  private $tcp_secondary_socket      = false;
+  /** @var string|false|mixed $unix_socket */
+  private $unix_socket               = false;
+  private string $unix_pending       = '';
+  private int $unix_would_block_bytes = 0;
   private string $packet             = '';
   private bool $immediate_flush      = false;
   private bool $shutdown_registered  = false;
   private string $addr;
   private string $network            = 'udp';
   private string $host_tag           = '';
-  /** @var string[] */
-  private array $dial_targets        = [];
-  private int $tcp_head              = 0;
+  private string $app_tag            = '';
   private float $last_flush_ts       = 0;
-  private float $last_dns_refresh_ts = 0;
+  private float $last_rare_log_ts    = 0;
 
-  public function __construct(string $addr) {
+  public function __construct(string $addr, string $application = 'mono') {
     $this->addr = $addr;
     $this->network = self::detectNetwork($addr);
     $this->host_tag = (string)gethostname();
-    $this->dial_targets = self::resolveDialTargetsSync($this->network, $addr);
-    $this->last_dns_refresh_ts = (float)microtime(true);
+    $this->app_tag = $application;
   }
 
   /**
@@ -172,7 +167,7 @@ class StatsHouse {
     }
     return $this->maybeFlush($metric, $now);
   }
-  
+
   /**
    * Advanced feature.
    * Encodes float as a raw tag in a special format, used by Statshouse.
@@ -278,75 +273,17 @@ class StatsHouse {
   }
 
   private static function detectNetwork(string $addr): string {
-    $parts = explode(',', $addr);
-    if (count($parts) === 0) {
+    if (strpos($addr, 'unix://') === 0) {
+      return 'unix';
+    }
+    if (strpos($addr, 'udp://') === 0) {
       return 'udp';
     }
-    $network = strtolower((string)parse_url($parts[0], PHP_URL_SCHEME));
-    if ($network === 'tcp' || $network === 'udp' || $network === 'unixgram') {
+    $network = strtolower((string)parse_url($addr, PHP_URL_SCHEME));
+    if ($network === 'udp' || $network === 'unix') {
       return $network;
     }
     return 'udp';
-  }
-
-  /** @return string[] */
-  private static function resolveDialTargetsSync(string $network, string $addr): array {
-    if ($addr === '') {
-      return [];
-    }
-    if ($network === 'unixgram') {
-      return [$addr];
-    }
-
-    $targets = explode(',', $addr);
-    if (count($targets) === 0) {
-      return [];
-    }
-    if ($network === 'udp') {
-      // For UDP we intentionally keep DNS names unresolved and dial hostnames directly.
-      return $targets;
-    }
-
-    $resolved = [];
-    for ($i = 0; $i < count($targets); $i++) {
-      $host = (string)parse_url($targets[$i], PHP_URL_HOST);
-      $port = (int)parse_url($targets[$i], PHP_URL_PORT);
-      if ($host === '' || $port <= 0) {
-        continue;
-      }
-      if (filter_var($host, FILTER_VALIDATE_IP) !== false) {
-        $resolved[] = $network . '://' . $host . ':' . $port;
-        continue;
-      }
-
-      $ips = self::resolveHost($host);
-      for ($j = 0; $j < count($ips); $j++) {
-        $resolved[] = $network . '://' . $ips[$j] . ':' . $port;
-      }
-    }
-    if (count($resolved) === 0) {
-      return $targets;
-    }
-    return $resolved;
-  }
-
-  /**
-   * Best-effort host resolve with optional soft timeout budget.
-   * Note: PHP DNS functions do not provide strict per-call cancellation.
-   *
-   * @return string[]
-   */
-  private static function resolveHost(string $host): array {
-    @ini_set('default_socket_timeout', (string)self::DNS_REFRESH_TIMEOUT_SEC);
-    $ips = gethostbynamel($host);
-    if ($ips !== false) {
-      return $ips;
-    }
-    $single = gethostbyname($host);
-    if ($single !== $host) {
-      return [$single];
-    }
-    return [];
   }
 
   /**
@@ -360,34 +297,16 @@ class StatsHouse {
     return $keys;
   }
 
-  private function maybeRefreshTcpDns(float $now): void {
-    if ($this->network !== 'tcp') {
-      return;
-    }
-    if ($now < $this->last_dns_refresh_ts + self::DNS_REFRESH_INTERVAL_SEC) {
-      return;
-    }
-    $this->dial_targets = self::resolveDialTargetsSync($this->network, $this->addr);
-    $this->last_dns_refresh_ts = $now;
-    $this->tcp_head = 0;
-  }
-
   private function maybeConnectUdp(): ?string {
     if ($this->udp_socket) {
       return null;
     }
-    $targets = $this->dial_targets;
-    if (count($targets) === 0) {
-      $targets = explode(',', $addr);
-    }
-    if (count($targets) === 0) {
-      return 'empty statshouse address';
-    }
-    $dialAddr = $targets[0];
+
     $error_code    = 0;
     $error_message = '';
-    $sock = stream_socket_client($dialAddr, $error_code, $error_message); // KPHP does not have fsockopen
+    $sock = stream_socket_client($this->addr, $error_code, $error_message); // KPHP does not have fsockopen
     if ($sock === false) {
+      $this->rareLog("failed to dial statshouse via udp: $error_message (code $error_code)");
       return "$error_message (code $error_code)";
     }
 
@@ -397,104 +316,115 @@ class StatsHouse {
     return null;
   }
 
-  private function writeTcp(string $payload): bool {
-    if (!$this->writeTcpByRole('primary', $payload)) {
-      if (!$this->writeTcpByRole('secondary', $payload)) {
-        return false;
-      }
-      $this->swapTcpSockets();
+  private function writeUnix(string $payload): bool {
+    $this->flushUnixPending();
+    if ($this->unix_pending !== '') {
+      $this->unix_would_block_bytes += strlen($payload);
+      return false;
     }
-    $this->ensureSecondaryConnected();
-    return true;
-  }
-
-  private function writeTcpByRole(string $role, string $payload): bool {
-    $sock = ($role === 'primary') ? $this->tcp_primary_socket : $this->tcp_secondary_socket;
-    if (!$sock) {
-      $err = $this->reconnectTcp($role);
-      if ($err !== null) {
-        return false;
-      }
-      $sock = ($role === 'primary') ? $this->tcp_primary_socket : $this->tcp_secondary_socket;
-    }
-    $ok = @fwrite($sock, $payload);
-    if ($ok !== false) {
+    if ($this->writeUnixSocket($payload)) {
+      $this->reportWouldBlockIfAny();
       return true;
     }
-    @fclose($sock);
-    if ($role === 'primary') {
-      $this->tcp_primary_socket = false;
-    } else {
-      $this->tcp_secondary_socket = false;
-    }
+    $this->unix_would_block_bytes += strlen($payload);
     return false;
   }
 
-  private function ensureSecondaryConnected(): void {
-    if ($this->tcp_secondary_socket) {
+  private function flushUnixPending(): void {
+    if ($this->unix_pending === '') {
       return;
     }
-    $this->reconnectTcp('secondary');
+    $this->writeUnixSocket('');
   }
 
-  private function reconnectTcp(string $role): ?string {
-    $pool = $this->dial_targets;
-    if (count($pool) === 0) {
+  private function writeUnixSocket(string $payload): bool {
+    $sock = $this->unix_socket;
+    if (!$sock) {
+      $err = $this->reconnectUnix();
+      if ($err !== null) {
+        $this->rareLog("failed to reconnect statshouse unix socket: $err");
+        return false;
+      }
+      $sock = $this->unix_socket;
+    }
+    $written = 0;
+    $buffer = $this->unix_pending . $payload;
+    $len = strlen($buffer);
+    while ($written < $len) {
+      $n = @fwrite($sock, substr($buffer, $written));
+      if ($n === false) {
+        $this->rareLog('failed to send data to statshouse via unix socket');
+        @fclose($sock);
+        $this->unix_socket = false;
+        if ($written > 0) {
+          $this->unix_pending = substr($buffer, $written);
+          return true;
+        }
+        return false;
+      }
+      if ($n === 0) {
+        break;
+      }
+      $written += $n;
+    }
+    if ($written >= $len) {
+      $this->unix_pending = '';
+      return true;
+    }
+    $this->unix_pending = substr($buffer, $written);
+    return true;
+  }
+
+  private function reconnectUnix(): ?string {
+    if ($this->unix_pending !== '') {
+      $this->unix_would_block_bytes += strlen($this->unix_pending);
+      $this->unix_pending = '';
+    }
+    if ($this->addr === '') {
       return 'empty statshouse address';
     }
-
-    $idx = $this->tcp_head;
-    $tried = 0;
-    while ($tried < count($pool)) {
-      $addr = $pool[$idx];
-      $error_code = 0;
-      $error_message = '';
-      $sock = stream_socket_client($addr, $error_code, $error_message, 5.0);
-      $idx = ($idx + 1) % count($pool);
-      $tried++;
-      if ($sock === false) {
-        continue;
-      }
-      $ok = @fwrite($sock, self::TCP_HEADER);
-      if ($ok === false) {
-        @fclose($sock);
-        continue;
-      }
-      $this->tcp_head = $idx;
-      if ($role === 'primary') {
-        $this->tcp_primary_socket = $sock;
-      } else {
-        $this->tcp_secondary_socket = $sock;
-      }
-      return null;
+    $error_code = 0;
+    $error_message = '';
+    $flags = STREAM_CLIENT_CONNECT | STREAM_CLIENT_ASYNC_CONNECT;
+    $sock = stream_socket_client($this->addr, $error_code, $error_message, 0.0, $flags);
+    if ($sock === false) {
+      $this->rareLog("failed to dial statshouse via unix: $error_message (code $error_code)");
+      return "$error_message (code $error_code)";
     }
-    return 'failed to dial statshouse';
+    @stream_set_blocking($sock, false);
+    $this->unix_socket = $sock;
+    $this->unix_pending = '';
+    return null;
   }
 
-  private function swapTcpSockets(): void {
-    $tmp = $this->tcp_primary_socket;
-    $this->tcp_primary_socket = $this->tcp_secondary_socket;
-    $this->tcp_secondary_socket = $tmp;
+  private function reportWouldBlockIfAny(): void {
+    if ($this->unix_would_block_bytes <= 0) {
+      return;
+    }
+    $n = $this->unix_would_block_bytes;
+    $this->unix_would_block_bytes = 0;
+    $this->rareLog("lost $n bytes");
+    $this->writeCount('__src_client_write_err', [
+      '1' => '4', // lang: php
+      '2' => '1', // kind: would block
+      '3' => $this->app_tag,
+    ], (float)$n, 0);
   }
 
   private function flush(string $metric, float $now, bool $close_after): ?string {
-    if ($this->network === 'tcp') {
-      $this->maybeRefreshTcpDns($now);
-      $tcpPayload = pack('V', strlen($this->packet)) . $this->packet;
-      if (!$this->writeTcp($tcpPayload)) {
+    if ($this->network === 'unix') {
+      $unixPayload = pack('V', strlen($this->packet)) . $this->packet;
+      if (!$this->writeUnix($unixPayload)) {
         $this->packet = '';
         return "$metric: write failed";
       }
 
       if ($close_after) {
-        if ($this->tcp_primary_socket) {
-          @fclose($this->tcp_primary_socket);
-          $this->tcp_primary_socket = false;
+        if ($this->unix_socket) {
+          @fclose($this->unix_socket);
+          $this->unix_socket = false;
         }
-        if ($this->tcp_secondary_socket) {
-          @fclose($this->tcp_secondary_socket);
-          $this->tcp_secondary_socket = false;
-        }
+        $this->unix_pending = '';
       }
 
       $this->last_flush_ts = $now;
@@ -539,5 +469,14 @@ class StatsHouse {
       return $this->flush($metric, $now, false);
     }
     return null;
+  }
+
+  private function rareLog(string $message): void {
+    $now = (float)microtime(true);
+    if ($now < $this->last_rare_log_ts + self::RARE_LOG_INTERVAL_SEC) {
+      return;
+    }
+    $this->last_rare_log_ts = $now;
+    error_log("[statshouse] $message");
   }
 }
