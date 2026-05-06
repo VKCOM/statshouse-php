@@ -385,7 +385,7 @@ class StatsHouse {
     }
     $error_code = 0;
     $error_message = '';
-    $flags = STREAM_CLIENT_CONNECT | STREAM_CLIENT_ASYNC_CONNECT;
+    $flags = STREAM_CLIENT_CONNECT;
     $sock = stream_socket_client($this->addr, $error_code, $error_message, 0.0, $flags);
     if ($sock === false) {
       $this->rareLog("failed to dial statshouse via unix: $error_message (code $error_code)");
