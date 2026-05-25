@@ -41,8 +41,6 @@ class StatsHouse {
   private const TL_STATSHOUSE_METRIC_VALUE_FIELDS_MASK    = 1 << 1;
   private const TL_STATSHOUSE_METRIC_UNIQUE_FIELDS_MASK   = 1 << 2;
 
-  private const RARE_LOG_INTERVAL_SEC    = 1.0;
-
   /** @var string|false|mixed $udp_socket */
   private $udp_socket                = false;
   /** @var string|false|mixed $unix_socket */
@@ -54,15 +52,12 @@ class StatsHouse {
   private bool $shutdown_registered  = false;
   private string $addr;
   private string $network            = 'udp';
-  private string $host_tag           = '';
   private string $app_tag            = '';
   private float $last_flush_ts       = 0;
-  private float $last_rare_log_ts    = 0;
 
   public function __construct(string $addr, string $application = 'mono') {
     $this->addr = $addr;
     $this->network = self::detectNetwork($addr);
-    $this->host_tag = (string)gethostname();
     $this->app_tag = $application;
   }
 
@@ -72,7 +67,7 @@ class StatsHouse {
    */
   public function writeCount(string $metric, $keys, float $count, int $ts): ?string {
     $now = (float)microtime(true);
-    $head = self::packHeader($metric, $this->addSystemTags($keys), $count, $ts, self::TL_STATSHOUSE_METRIC_COUNTER_FIELDS_MASK);
+    $head = self::packHeader($metric, $keys, $count, $ts, self::TL_STATSHOUSE_METRIC_COUNTER_FIELDS_MASK);
     if (strlen($head) > self::MAX_PAYLOAD_SIZE) {
       return self::ERR_HEADER_TOO_BIG;
     }
@@ -101,7 +96,7 @@ class StatsHouse {
       $fields_mask |= self::TL_STATSHOUSE_METRIC_COUNTER_FIELDS_MASK;
     }
     $now = (float)microtime(true);
-    $head = self::packHeader($metric, $this->addSystemTags($keys), $count, $ts, $fields_mask);
+    $head = self::packHeader($metric, $keys, $count, $ts, $fields_mask);
     for ($pos = 0; $pos < $total;) {
       $start_pos = $pos;
       $remaining_space = self::MAX_PAYLOAD_SIZE - strlen($this->packet) - strlen($head) - self::TL_LEN_SIZE;
@@ -142,7 +137,7 @@ class StatsHouse {
       $fields_mask |= self::TL_STATSHOUSE_METRIC_COUNTER_FIELDS_MASK;
     }
     $now = (float)microtime(true);
-    $head = self::packHeader($metric, $this->addSystemTags($keys), $count, $ts, $fields_mask);
+    $head = self::packHeader($metric, $keys, $count, $ts, $fields_mask);
     for ($pos = 0; $pos < $total;) {
       $start_pos = $pos;
       $remaining_space = self::MAX_PAYLOAD_SIZE - strlen($this->packet) - strlen($head) - self::TL_LEN_SIZE;
@@ -286,17 +281,6 @@ class StatsHouse {
     return 'udp';
   }
 
-  /**
-   * @param string[] $keys
-   * @return string[]
-   */
-  private function addSystemTags($keys): array {
-    if ($this->host_tag !== '' && !array_key_exists('_h', $keys)) {
-      $keys['_h'] = $this->host_tag;
-    }
-    return $keys;
-  }
-
   private function maybeConnectUdp(): ?string {
     if ($this->udp_socket) {
       return null;
@@ -306,7 +290,6 @@ class StatsHouse {
     $error_message = '';
     $sock = stream_socket_client($this->addr, $error_code, $error_message); // KPHP does not have fsockopen
     if ($sock === false) {
-      $this->rareLog("failed to dial statshouse via udp: $error_message (code $error_code)");
       return "$error_message (code $error_code)";
     }
 
@@ -342,7 +325,6 @@ class StatsHouse {
     if (!$sock) {
       $err = $this->reconnectUnix();
       if ($err !== null) {
-        $this->rareLog("failed to reconnect statshouse unix socket: $err");
         return false;
       }
       $sock = $this->unix_socket;
@@ -353,7 +335,6 @@ class StatsHouse {
     while ($written < $len) {
       $n = @fwrite($sock, substr($buffer, $written));
       if ($n === false) {
-        $this->rareLog('failed to send data to statshouse via unix socket');
         @fclose($sock);
         $this->unix_socket = false;
         if ($written > 0) {
@@ -388,7 +369,6 @@ class StatsHouse {
     $flags = STREAM_CLIENT_CONNECT;
     $sock = stream_socket_client($this->addr, $error_code, $error_message, 0.0, $flags);
     if ($sock === false) {
-      $this->rareLog("failed to dial statshouse via unix: $error_message (code $error_code)");
       return "$error_message (code $error_code)";
     }
     @stream_set_blocking($sock, false);
@@ -403,7 +383,6 @@ class StatsHouse {
     }
     $n = $this->unix_would_block_bytes;
     $this->unix_would_block_bytes = 0;
-    $this->rareLog("lost $n bytes");
     $this->writeCount('__src_client_write_err', [
       '1' => '4', // lang: php
       '2' => '1', // kind: would block
@@ -469,14 +448,5 @@ class StatsHouse {
       return $this->flush($metric, $now, false);
     }
     return null;
-  }
-
-  private function rareLog(string $message): void {
-    $now = (float)microtime(true);
-    if ($now < $this->last_rare_log_ts + self::RARE_LOG_INTERVAL_SEC) {
-      return;
-    }
-    $this->last_rare_log_ts = $now;
-    error_log("[statshouse] $message");
   }
 }
