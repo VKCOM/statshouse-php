@@ -338,7 +338,7 @@ class StatsHouse {
         @fclose($sock);
         $this->unix_socket = false;
         if ($written > 0) {
-          $this->unix_pending = substr($buffer, $written);
+          $this->unix_pending = (string)substr($buffer, $written);
           return true;
         }
         return false;
@@ -352,7 +352,7 @@ class StatsHouse {
       $this->unix_pending = '';
       return true;
     }
-    $this->unix_pending = substr($buffer, $written);
+    $this->unix_pending = (string)substr($buffer, $written);
     return true;
   }
 
@@ -383,11 +383,14 @@ class StatsHouse {
     }
     $n = $this->unix_would_block_bytes;
     $this->unix_would_block_bytes = 0;
-    $this->writeCount('__src_client_write_err', [
+    $err = $this->writeCount('__src_client_write_err', [
       '1' => '4', // lang: php
       '2' => '1', // kind: would block
       '3' => $this->app_tag,
     ], (float)$n, 0);
+    if ($err !== null) {
+      return;
+    }
   }
 
   private function flush(string $metric, float $now, bool $close_after): ?string {
