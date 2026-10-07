@@ -9,7 +9,8 @@
   "type": "library",
   "license": "MPL-2.0",
   "require": {
-    "php": ">=7.1"
+    "php": ">=7.1",
+    "promphp/prometheus_client_php": "^2.14"
   },
   "autoload": {
     "psr-4": {
