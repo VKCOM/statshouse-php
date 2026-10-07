@@ -7,6 +7,9 @@
 
 declare(strict_types = 1);
 
+#ifndef KPHP
+// PHP-only. KPHP skips this file: the Prometheus client is not available there.
+
 namespace VK\StatsHouse;
 
 use InvalidArgumentException;
@@ -18,8 +21,9 @@ use Throwable;
 
 /**
  * StatsHouse stays primary. This wrapper mirrors counters and values into
- * Prometheus and POSTs the text exposition. Mirror and push failures stay here.
- * Unique metrics are not mirrored.
+ * Prometheus and POSTs the text exposition. Each successful push sends only the
+ * delta accumulated since the previous successful push, then clears the registry.
+ * A failed push keeps that delta for the retry. Unique metrics are not mirrored.
  */
 class StatsHouseMirror {
   private const NAMESPACE = 'sh_mirror';
@@ -34,25 +38,24 @@ class StatsHouseMirror {
   private array $constLabels = [];
   /** @var array<string, true> */
   private array $exclude = [];
+  /** @var array<string, true> */
+  private array $include = [];
   /** @var callable|null */
   private $sender = null;
   private string $pushUrl = '';
-  private float $timeoutSec = 5.0;
+  private float $timeoutSec = 1.0;
   private float $pushIntervalSec = 15.0;
   private float $lastPushTs = 0.0;
   private string $transport = 'stream';
   private bool $dirty = false;
-  /** @var array<string, string> sanitized prom name => original metric */
-  private array $sources = [];
-  /** @var array<string, string> sanitized prom name => counter|histogram */
-  private array $kinds = [];
-  /** @var array<string, string[]> sanitized prom name => label names */
-  private array $labelSets = [];
 
   /**
    * @param array<string, mixed> $options
    */
   public function __construct(StatsHouse $sh, array $options = []) {
+    if (!class_exists(CollectorRegistry::class)) {
+      throw new \RuntimeException('StatsHouseMirror requires promphp/prometheus_client_php');
+    }
     $this->sh = $sh;
     $this->registry = new CollectorRegistry(new InMemory(), false);
     $this->enabled = (bool)($options['enabled'] ?? true);
@@ -68,6 +71,13 @@ class StatsHouseMirror {
       foreach ($options['exclude'] as $name) {
         if (is_string($name) && $name !== '') {
           $this->exclude[$name] = true;
+        }
+      }
+    }
+    if (isset($options['include']) && is_array($options['include'])) {
+      foreach ($options['include'] as $name) {
+        if (is_string($name) && $name !== '') {
+          $this->include[$name] = true;
         }
       }
     }
@@ -110,6 +120,7 @@ class StatsHouseMirror {
       $this->mirrorCount($metric, $keys, $count);
       $this->maybePush();
     } catch (Throwable $e) {
+      $this->logMirror($metric . ': ' . $e->getMessage());
     }
     return $err;
   }
@@ -124,6 +135,7 @@ class StatsHouseMirror {
       $this->mirrorValue($metric, $keys, $values);
       $this->maybePush();
     } catch (Throwable $e) {
+      $this->logMirror($metric . ': ' . $e->getMessage());
     }
     return $err;
   }
@@ -161,10 +173,13 @@ class StatsHouseMirror {
       if ($this->sender !== null) {
         ($this->sender)($body);
       } elseif ($this->pushUrl !== '' && !$this->httpPost($body)) {
+        $this->logMirror('push failed');
         return;
       }
       $this->dirty = false;
+      $this->registry = new CollectorRegistry(new InMemory(), false);
     } catch (Throwable $e) {
+      $this->logMirror('push failed: ' . $e->getMessage());
     }
   }
 
@@ -177,7 +192,7 @@ class StatsHouseMirror {
     }
     $name = $this->sanitizeMetric($metric);
     $labels = $this->labelMap($keys);
-    if ($name === null || $labels === null || !$this->lockSeries($name, $metric, 'counter', $labels)) {
+    if ($name === null || $labels === null) {
       return;
     }
     $this->registry
@@ -209,7 +224,7 @@ class StatsHouseMirror {
     }
     $name = $this->sanitizeMetric($metric);
     $labels = $this->labelMap($keys);
-    if ($name === null || $labels === null || !$this->lockSeries($name, $metric, 'histogram', $labels)) {
+    if ($name === null || $labels === null) {
       return;
     }
     $histogram = $this->registry->getOrRegisterHistogram(
@@ -226,29 +241,18 @@ class StatsHouseMirror {
   }
 
   private function shouldMirror(string $metric): bool {
-    return $this->enabled && $metric !== '' && !isset($this->exclude[$metric]);
+    if (!$this->enabled || $metric === '') {
+      return false;
+    }
+    if ($this->include !== []) {
+      return isset($this->include[$metric]);
+    }
+    return !isset($this->exclude[$metric]);
   }
 
-  /**
-   * First metric name, kind, and label set win. Later conflicts are dropped.
-   *
-   * @param array<string, string> $labels
-   */
-  private function lockSeries(string $name, string $metric, string $kind, array $labels): bool {
-    if (isset($this->sources[$name]) && $this->sources[$name] !== $metric) {
-      return false;
-    }
-    if (isset($this->kinds[$name]) && $this->kinds[$name] !== $kind) {
-      return false;
-    }
-    $names = array_keys($labels);
-    if (isset($this->labelSets[$name]) && $this->labelSets[$name] !== $names) {
-      return false;
-    }
-    $this->sources[$name] = $metric;
-    $this->kinds[$name] = $kind;
-    $this->labelSets[$name] = $names;
-    return true;
+  private function logMirror(string $message): void {
+    $line = strstr($message, "\n", true);
+    error_log('statshouse mirror: ' . ($line === false ? $message : $line));
   }
 
   private function maybePush(): void {
@@ -301,12 +305,6 @@ class StatsHouseMirror {
     }
     if (preg_match('/^[a-zA-Z_]/', $name) !== 1) {
       $name = '_' . $name;
-    }
-    if (strpos($name, '__') === 0) {
-      $name = 'l' . $name;
-    }
-    if ($name === 'le') {
-      $name = 'le_label';
     }
     try {
       Collector::assertValidLabel($name);
@@ -426,3 +424,5 @@ class StatsHouseMirror {
     return $code >= 200 && $code < 300;
   }
 }
+
+#endif

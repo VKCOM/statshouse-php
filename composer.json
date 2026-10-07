@@ -9,8 +9,10 @@
   "type": "library",
   "license": "MPL-2.0",
   "require": {
-    "php": ">=7.1",
-    "promphp/prometheus_client_php": "^2.14"
+    "php": ">=7.1"
+  },
+  "suggest": {
+    "promphp/prometheus_client_php": "PHP-only Prometheus mirror (VK\\StatsHouse\\StatsHouseMirror). Not used by KPHP."
   },
   "autoload": {
     "psr-4": {
