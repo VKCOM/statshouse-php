@@ -7,106 +7,130 @@
 
 declare(strict_types = 1);
 
-#ifndef KPHP
-// PHP-only. KPHP skips this file: the Prometheus client is not available there.
-
 namespace VK\StatsHouse;
 
 use InvalidArgumentException;
-use Prometheus\Collector;
-use Prometheus\CollectorRegistry;
-use Prometheus\RenderTextFormat;
-use Prometheus\Storage\InMemory;
 use Throwable;
 
+#ifndef KPHP
+if (!function_exists(__NAMESPACE__ . '\\warning')) {
+  function warning(string $message): void {
+    error_log($message);
+  }
+}
+#endif
+
 /**
- * StatsHouse stays primary. This wrapper mirrors counters and values into
- * Prometheus and POSTs the text exposition. Each successful push sends only the
- * delta accumulated since the previous successful push, then clears the registry.
- * A failed push keeps that delta for the retry. Unique metrics are not mirrored.
+ * KPHP-compilable. StatsHouse stays primary.
+ * Counters and values are mirrored into Prometheus text and POSTed.
+ * Each successful push sends only the delta since the previous successful
+ * push, then clears that delta. A failed push keeps it for the retry.
+ * Unique metrics are not mirrored.
  */
 class StatsHouseMirror {
   private const NAMESPACE = 'sh_mirror';
+  private const TEXT_MIME = 'text/plain; version=0.0.4';
   private const VALUE_BUCKETS = [
     0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 25, 50, 100, 250, 500, 1000,
   ];
 
   private StatsHouse $sh;
-  private CollectorRegistry $registry;
-  private bool $enabled;
+  /** @var array<string, string[]> */
+  private array $counterSeries = [];
+  /** @var array<string, float> */
+  private array $counterValue = [];
+  /** @var array<string, string[]> */
+  private array $counterLabels = [];
+  /** @var array<string, string[]> */
+  private array $histogramSeries = [];
+  /** @var array<string, float> */
+  private array $histogramSum = [];
+  /** @var array<string, float> */
+  private array $histogramCount = [];
+  /** @var array<string, float> */
+  private array $histogramBucket = [];
+  /** @var array<string, string[]> */
+  private array $histogramLabels = [];
+  /** @var array<string, array<string, string>> */
+  private array $seriesLabels = [];
+  private bool $enabled = true;
   /** @var array<string, string> */
   private array $constLabels = [];
   /** @var array<string, true> */
   private array $exclude = [];
   /** @var array<string, true> */
   private array $include = [];
-  /** @var callable|null */
-  private $sender = null;
   private string $pushUrl = '';
   private float $timeoutSec = 1.0;
   private float $pushIntervalSec = 15.0;
   private float $lastPushTs = 0.0;
-  private string $transport = 'stream';
+  private string $transport = 'curl';
   private bool $dirty = false;
 
   /**
-   * @param array<string, mixed> $options
+   * @param array $options
    */
   public function __construct(StatsHouse $sh, array $options = []) {
-    if (!class_exists(CollectorRegistry::class)) {
-      throw new \RuntimeException('StatsHouseMirror requires promphp/prometheus_client_php');
-    }
     $this->sh = $sh;
-    $this->registry = new CollectorRegistry(new InMemory(), false);
-    $this->enabled = (bool)($options['enabled'] ?? true);
+    $enabled = $options['enabled'] ?? true;
+    $this->enabled = is_bool($enabled) ? $enabled : (bool)$enabled;
     $this->transport = function_exists('curl_init') ? 'curl' : 'stream';
     $this->lastPushTs = microtime(true);
 
     foreach (['product_id', 'service', 'instance'] as $name) {
-      if (isset($options[$name]) && is_string($options[$name])) {
-        $this->constLabels[$name] = $options[$name];
+      $value = $options[$name] ?? null;
+      if (is_string($value)) {
+        $this->constLabels[$name] = $value;
       }
     }
-    if (isset($options['exclude']) && is_array($options['exclude'])) {
-      foreach ($options['exclude'] as $name) {
+    $exclude = $options['exclude'] ?? null;
+    if (is_array($exclude)) {
+      foreach ($exclude as $name) {
         if (is_string($name) && $name !== '') {
           $this->exclude[$name] = true;
         }
       }
     }
-    if (isset($options['include']) && is_array($options['include'])) {
-      foreach ($options['include'] as $name) {
+    $include = $options['include'] ?? null;
+    if (is_array($include)) {
+      foreach ($include as $name) {
         if (is_string($name) && $name !== '') {
           $this->include[$name] = true;
         }
       }
     }
-    if (isset($options['sender'])) {
-      if (!is_callable($options['sender'])) {
-        throw new InvalidArgumentException('sender must be callable');
-      }
-      $this->sender = $options['sender'];
+    $pushUrl = $options['push_url'] ?? null;
+    if (is_string($pushUrl)) {
+      self::validatePushUrl($pushUrl);
+      $this->pushUrl = $pushUrl;
+    } elseif ($pushUrl !== null) {
+      throw new InvalidArgumentException('push_url must be an http or https URL');
     }
-    if (isset($options['push_url'])) {
-      if (!is_string($options['push_url'])) {
-        throw new InvalidArgumentException('push_url must be an http or https URL');
+    $timeout = $options['timeout_sec'] ?? null;
+    if (is_int($timeout) || is_float($timeout)) {
+      $timeout = (float)$timeout;
+      if ($timeout > 0) {
+        $this->timeoutSec = $timeout;
       }
-      self::validatePushUrl($options['push_url']);
-      $this->pushUrl = $options['push_url'];
-    }
-    if (isset($options['timeout_sec']) && is_numeric($options['timeout_sec'])) {
-      $timeout = (float)$options['timeout_sec'];
+    } elseif (is_string($timeout) && is_numeric($timeout)) {
+      $timeout = (float)$timeout;
       if ($timeout > 0) {
         $this->timeoutSec = $timeout;
       }
     }
-    if (isset($options['push_interval_sec']) && is_numeric($options['push_interval_sec'])) {
-      $interval = (float)$options['push_interval_sec'];
+    $interval = $options['push_interval_sec'] ?? null;
+    if (is_int($interval) || is_float($interval)) {
+      $interval = (float)$interval;
+      $this->pushIntervalSec = $interval > 0 ? $interval : 0.0;
+    } elseif (is_string($interval) && is_numeric($interval)) {
+      $interval = (float)$interval;
       $this->pushIntervalSec = $interval > 0 ? $interval : 0.0;
     }
-    if ($options['push_on_shutdown'] ?? true) {
-      register_shutdown_function(function (): void {
-        $this->push();
+    $shutdown = $options['push_on_shutdown'] ?? true;
+    if ($shutdown) {
+      $self = $this;
+      register_shutdown_function(function () use ($self): void {
+        $self->push();
       });
     }
   }
@@ -149,14 +173,68 @@ class StatsHouseMirror {
   }
 
   public function render(): string {
-    if (!$this->enabled) {
+    if (!$this->enabled || ($this->counterSeries === [] && $this->histogramSeries === [])) {
       return '';
     }
-    $metrics = $this->registry->getMetricFamilySamples();
-    if ($metrics === []) {
-      return '';
+    $lines = [];
+    foreach ($this->counterSeries as $name => $keys) {
+      if (!is_string($name)) {
+        continue;
+      }
+      $lines[] = '# HELP ' . $name . ' StatsHouse counter mirrored to Prometheus';
+      $lines[] = '# TYPE ' . $name . ' counter';
+      $ordered = $keys;
+      sort($ordered, SORT_STRING);
+      foreach ($ordered as $key) {
+        if (!is_string($key)) {
+          continue;
+        }
+        $id = $this->storeKey($name, $key);
+        if (isset($this->seriesLabels[$id], $this->counterValue[$id])) {
+          $lines[] = $this->sampleLine($name, $this->seriesLabels[$id], $this->counterValue[$id]);
+        }
+      }
     }
-    return (new RenderTextFormat())->render($metrics);
+    foreach ($this->histogramSeries as $name => $keys) {
+      if (!is_string($name)) {
+        continue;
+      }
+      $lines[] = '# HELP ' . $name . ' StatsHouse value mirrored as histogram';
+      $lines[] = '# TYPE ' . $name . ' histogram';
+      $ordered = $keys;
+      sort($ordered, SORT_STRING);
+      foreach ($ordered as $key) {
+        if (!is_string($key)) {
+          continue;
+        }
+        $id = $this->storeKey($name, $key);
+        if (!isset($this->seriesLabels[$id], $this->histogramCount[$id], $this->histogramSum[$id])) {
+          continue;
+        }
+        $labels = $this->seriesLabels[$id];
+        $accumulated = 0.0;
+        foreach (self::VALUE_BUCKETS as $edge) {
+          $bound = (string)$edge;
+          $bucketId = $id . "\0" . $bound;
+          if (isset($this->histogramBucket[$bucketId])) {
+            $accumulated += $this->histogramBucket[$bucketId];
+          }
+          $bucketLabels = $labels;
+          $bucketLabels['le'] = $bound;
+          $lines[] = $this->sampleLine($name . '_bucket', $bucketLabels, $accumulated);
+        }
+        $infId = $id . "\0+Inf";
+        if (isset($this->histogramBucket[$infId])) {
+          $accumulated += $this->histogramBucket[$infId];
+        }
+        $bucketLabels = $labels;
+        $bucketLabels['le'] = '+Inf';
+        $lines[] = $this->sampleLine($name . '_bucket', $bucketLabels, $accumulated);
+        $lines[] = $this->sampleLine($name . '_count', $labels, $this->histogramCount[$id]);
+        $lines[] = $this->sampleLine($name . '_sum', $labels, $this->histogramSum[$id]);
+      }
+    }
+    return implode("\n", $lines) . "\n";
   }
 
   public function push(): void {
@@ -170,21 +248,19 @@ class StatsHouseMirror {
         $this->dirty = false;
         return;
       }
-      if ($this->sender !== null) {
-        ($this->sender)($body);
-      } elseif ($this->pushUrl !== '' && !$this->httpPost($body)) {
+      if ($this->pushUrl !== '' && !$this->httpPost($body)) {
         $this->logMirror('push failed');
         return;
       }
       $this->dirty = false;
-      $this->registry = new CollectorRegistry(new InMemory(), false);
+      $this->clearSamples();
     } catch (Throwable $e) {
       $this->logMirror('push failed: ' . $e->getMessage());
     }
   }
 
   /**
-   * @param string[] $keys
+   * @param array $keys
    */
   private function mirrorCount(string $metric, $keys, float $count): void {
     if (!$this->shouldMirror($metric) || !is_finite($count) || $count <= 0) {
@@ -195,18 +271,28 @@ class StatsHouseMirror {
     if ($name === null || $labels === null) {
       return;
     }
-    $this->registry
-      ->getOrRegisterCounter(self::NAMESPACE, $name, 'StatsHouse counter mirrored to Prometheus', array_keys($labels))
-      ->incBy($count, array_values($labels));
+    $full = self::NAMESPACE . '_' . $name;
+    $this->rememberLabels($this->counterLabels, $full, $labels);
+    $key = $this->seriesKey($labels);
+    $id = $this->storeKey($full, $key);
+    if (!isset($this->counterValue[$id])) {
+      if (!isset($this->counterSeries[$full])) {
+        $this->counterSeries[$full] = [];
+      }
+      $this->counterSeries[$full][] = $key;
+      $this->seriesLabels[$id] = $labels;
+      $this->counterValue[$id] = 0.0;
+    }
+    $this->counterValue[$id] += $count;
     $this->dirty = true;
   }
 
   /**
-   * @param string[] $keys
-   * @param float[] $values
+   * @param array $keys
+   * @param array $values
    */
   private function mirrorValue(string $metric, $keys, $values): void {
-    if (!$this->shouldMirror($metric) || !is_array($values)) {
+    if (!$this->shouldMirror($metric)) {
       return;
     }
     $finite = [];
@@ -227,17 +313,41 @@ class StatsHouseMirror {
     if ($name === null || $labels === null) {
       return;
     }
-    $histogram = $this->registry->getOrRegisterHistogram(
-      self::NAMESPACE,
-      $name,
-      'StatsHouse value mirrored as histogram',
-      array_keys($labels),
-      self::VALUE_BUCKETS
-    );
+    if (in_array('le', array_keys($labels), true)) {
+      throw new InvalidArgumentException("Histogram cannot have a label named 'le'.");
+    }
+    $full = self::NAMESPACE . '_' . $name;
+    $this->rememberLabels($this->histogramLabels, $full, $labels);
+    $key = $this->seriesKey($labels);
+    $id = $this->storeKey($full, $key);
+    if (!isset($this->histogramSum[$id])) {
+      if (!isset($this->histogramSeries[$full])) {
+        $this->histogramSeries[$full] = [];
+      }
+      $this->histogramSeries[$full][] = $key;
+      $this->seriesLabels[$id] = $labels;
+      $this->histogramSum[$id] = 0.0;
+      $this->histogramCount[$id] = 0.0;
+    }
     foreach ($finite as $value) {
-      $histogram->observe($value, array_values($labels));
+      $bound = '+Inf';
+      foreach (self::VALUE_BUCKETS as $edge) {
+        if ($value <= $edge) {
+          $bound = (string)$edge;
+          break;
+        }
+      }
+      $bucketId = $id . "\0" . $bound;
+      $bucket = $this->histogramBucket[$bucketId] ?? 0.0;
+      $this->histogramBucket[$bucketId] = $bucket + 1.0;
+      $this->histogramSum[$id] += $value;
+      $this->histogramCount[$id] += 1.0;
     }
     $this->dirty = true;
+  }
+
+  private function storeKey(string $full, string $seriesKey): string {
+    return $full . "\0" . $seriesKey;
   }
 
   private function shouldMirror(string $metric): bool {
@@ -252,7 +362,8 @@ class StatsHouseMirror {
 
   private function logMirror(string $message): void {
     $line = strstr($message, "\n", true);
-    error_log('statshouse mirror: ' . ($line === false ? $message : $line));
+    $text = 'statshouse mirror: ' . (is_string($line) ? $line : $message);
+    warning($text);
   }
 
   private function maybePush(): void {
@@ -266,13 +377,12 @@ class StatsHouseMirror {
   }
 
   private function sanitizeMetric(string $metric): ?string {
-    $name = preg_replace('/[^a-zA-Z0-9_:]/', '_', $metric);
-    if (!is_string($name) || $name === '') {
+    $cleaned = preg_replace('/[^a-zA-Z0-9_:]/', '_', $metric);
+    if (!is_string($cleaned) || $cleaned === '') {
       return null;
     }
-    try {
-      Collector::assertValidMetricName(self::NAMESPACE . '_' . $name);
-    } catch (InvalidArgumentException $e) {
+    $name = $cleaned;
+    if (preg_match('/^[a-zA-Z_:][a-zA-Z0-9_:]*$/', self::NAMESPACE . '_' . $name) !== 1) {
       return null;
     }
     return $name;
@@ -285,11 +395,14 @@ class StatsHouseMirror {
     if (is_int($key)) {
       return (string)($key + 1);
     }
-    $name = (string)$key;
-    if (strlen($name) >= 2 && $name[0] === '_' && is_numeric($name[1])) {
-      return substr($name, 1);
+    if (!is_string($key)) {
+      return '';
     }
-    return $name;
+    if (strlen($key) >= 2 && $key[0] === '_' && is_numeric($key[1])) {
+      $tail = substr($key, 1);
+      return is_string($tail) ? $tail : $key;
+    }
+    return $key;
   }
 
   private function sanitizeLabel(string $name): ?string {
@@ -299,19 +412,88 @@ class StatsHouseMirror {
     if (preg_match('/^[0-9]+$/', $name) === 1) {
       $name = 'tag_' . $name;
     }
-    $name = preg_replace('/[^a-zA-Z0-9_]/', '_', $name);
-    if (!is_string($name) || $name === '') {
+    $cleaned = preg_replace('/[^a-zA-Z0-9_]/', '_', $name);
+    if (!is_string($cleaned) || $cleaned === '') {
       return null;
     }
+    $name = $cleaned;
     if (preg_match('/^[a-zA-Z_]/', $name) !== 1) {
       $name = '_' . $name;
     }
-    try {
-      Collector::assertValidLabel($name);
-    } catch (InvalidArgumentException $e) {
+    if (preg_match('/^[a-zA-Z_][a-zA-Z0-9_]*$/', $name) !== 1 || strpos($name, '__') === 0) {
       return null;
     }
     return $name;
+  }
+
+  /**
+   * @param array<string, string[]> $known
+   * @param array<string, string> $labels
+   */
+  private function rememberLabels(array &$known, string $name, array $labels): void {
+    $names = [];
+    foreach ($labels as $label => $labelValue) {
+      if (is_string($label) && is_string($labelValue)) {
+        $names[] = $label;
+      }
+    }
+    if (!isset($known[$name])) {
+      $known[$name] = $names;
+      return;
+    }
+    if (count($names) !== count($known[$name])) {
+      throw new InvalidArgumentException(sprintf('Labels are not defined correctly: %s', print_r(array_values($labels), true)));
+    }
+  }
+
+  /**
+   * @param array<string, string> $labels
+   */
+  private function seriesKey(array $labels): string {
+    $key = json_encode($labels);
+    return is_string($key) ? $key : '';
+  }
+
+  /**
+   * @param array $labels
+   */
+  private function sampleLine(string $name, array $labels, float $value): string {
+    if (count($labels) === 0) {
+      return $name . ' ' . $this->formatNumber($value);
+    }
+    $parts = [];
+    foreach ($labels as $label => $labelValue) {
+      if (!is_string($label) || !is_string($labelValue)) {
+        continue;
+      }
+      $parts[] = $label . '="' . $this->escapeLabelValue($labelValue) . '"';
+    }
+    if ($parts === []) {
+      return $name . ' ' . $this->formatNumber($value);
+    }
+    return $name . '{' . implode(',', $parts) . '} ' . $this->formatNumber($value);
+  }
+
+  private function formatNumber(float $value): string {
+    $text = sprintf('%.16F', $value);
+    $text = rtrim(rtrim($text, '0'), '.');
+    return $text === '' || $text === '-' ? '0' : $text;
+  }
+
+  private function escapeLabelValue(string $value): string {
+    return str_replace(["\\", "\n", "\""], ["\\\\", "\\n", "\\\""], $value);
+  }
+
+  private function clearSamples(): void {
+    $this->counterSeries = [];
+    $this->counterValue = [];
+    $this->counterLabels = [];
+    $this->histogramSeries = [];
+    $this->histogramSum = [];
+    $this->histogramCount = [];
+    $this->histogramBucket = [];
+    $this->histogramLabels = [];
+    $this->seriesLabels = [];
   }
 
   /**
@@ -345,8 +527,18 @@ class StatsHouseMirror {
       throw new InvalidArgumentException('push_url must be an http or https URL');
     }
     $parts = parse_url($url);
-    $scheme = strtolower((string)(is_array($parts) ? ($parts['scheme'] ?? '') : ''));
-    $host = is_array($parts) ? (string)($parts['host'] ?? '') : '';
+    $scheme = '';
+    $host = '';
+    if (is_array($parts)) {
+      $schemeRaw = $parts['scheme'] ?? '';
+      $hostRaw = $parts['host'] ?? '';
+      if (is_string($schemeRaw)) {
+        $scheme = strtolower($schemeRaw);
+      }
+      if (is_string($hostRaw)) {
+        $host = $hostRaw;
+      }
+    }
     if (($scheme !== 'http' && $scheme !== 'https') || $host === '') {
       throw new InvalidArgumentException('push_url must be an http or https URL');
     }
@@ -368,43 +560,48 @@ class StatsHouseMirror {
       return false;
     }
     $ch = curl_init($this->pushUrl);
-    if ($ch === false) {
+    $timeoutMs = (int)max(1, (int)round($this->timeoutSec * 1000));
+    if (!curl_setopt($ch, CURLOPT_POST, 1)) {
       return false;
     }
-    $timeoutMs = (int)max(1, round($this->timeoutSec * 1000));
-    $options = [
-      CURLOPT_POST => true,
-      CURLOPT_POSTFIELDS => $body,
-      CURLOPT_HTTPHEADER => ['Content-Type: ' . RenderTextFormat::MIME_TYPE],
-      CURLOPT_RETURNTRANSFER => true,
-      CURLOPT_FOLLOWLOCATION => false,
-      CURLOPT_TIMEOUT_MS => $timeoutMs,
-      CURLOPT_CONNECTTIMEOUT_MS => $timeoutMs,
-    ];
-    if (defined('CURLOPT_PROTOCOLS_STR')) {
-      $options[CURLOPT_PROTOCOLS_STR] = 'http,https';
-    } elseif (defined('CURLOPT_PROTOCOLS') && defined('CURLPROTO_HTTP') && defined('CURLPROTO_HTTPS')) {
-      $options[CURLOPT_PROTOCOLS] = CURLPROTO_HTTP | CURLPROTO_HTTPS;
+    if (!curl_setopt($ch, CURLOPT_POSTFIELDS, $body)) {
+      return false;
     }
-    if (defined('CURLOPT_REDIR_PROTOCOLS_STR')) {
-      $options[CURLOPT_REDIR_PROTOCOLS_STR] = 'http,https';
-    } elseif (defined('CURLOPT_REDIR_PROTOCOLS') && defined('CURLPROTO_HTTP') && defined('CURLPROTO_HTTPS')) {
-      $options[CURLOPT_REDIR_PROTOCOLS] = CURLPROTO_HTTP | CURLPROTO_HTTPS;
+    if (!curl_setopt($ch, CURLOPT_HTTPHEADER, ['Content-Type: ' . self::TEXT_MIME])) {
+      return false;
     }
-    curl_setopt_array($ch, $options);
+    if (!curl_setopt($ch, CURLOPT_RETURNTRANSFER, 1)) {
+      return false;
+    }
+    if (!curl_setopt($ch, CURLOPT_FOLLOWLOCATION, 0)) {
+      return false;
+    }
+    if (!curl_setopt($ch, CURLOPT_TIMEOUT_MS, $timeoutMs)) {
+      return false;
+    }
+    if (!curl_setopt($ch, CURLOPT_CONNECTTIMEOUT_MS, $timeoutMs)) {
+      return false;
+    }
     $result = curl_exec($ch);
-    $code = (int)curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
-    return $result !== false && $code >= 200 && $code < 300;
+    $info = curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
+    $code = -1;
+    if (is_int($info)) {
+      $code = $info;
+    } elseif (is_float($info) || (is_string($info) && is_numeric($info))) {
+      $code = (int)$info;
+    }
+    return $result !== false && $result !== null && $code >= 200 && $code < 300;
   }
 
   private function postStream(string $body): bool {
+#ifndef KPHP
     if ($this->pushUrl === '') {
       return false;
     }
     $context = stream_context_create([
       'http' => [
         'method' => 'POST',
-        'header' => 'Content-Type: ' . RenderTextFormat::MIME_TYPE . "\r\n",
+        'header' => 'Content-Type: ' . self::TEXT_MIME . "\r\n",
         'content' => $body,
         'timeout' => $this->timeoutSec,
         'ignore_errors' => true,
@@ -422,7 +619,7 @@ class StatsHouseMirror {
     }
     $code = (int)$matches[1];
     return $code >= 200 && $code < 300;
+#endif
+    return strlen($body) < 0;
   }
 }
-
-#endif
